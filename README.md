@@ -261,7 +261,7 @@ The API key's user lacks permission. Make sure the key belongs to an admin or ha
 
 ### Bot works, links don't open
 
-`OPENWEBUI_BASE_URL` is set to a URL that isn't reachable from your phone. If your OWUI is behind a domain like `https://oi.example.com`, use that — not `http://localhost:3000`.
+`OPENWEBUI_BASE_URL` is set to a URL that isn't reachable from your phone. If your OWUI is behind a domain like `https://openwebui.example.com`, use that — not `http://localhost:3000`.
 
 ### Sessions forgotten after restart
 
@@ -304,7 +304,7 @@ Install it in OWUI:
 3. Save and configure the **Valves**:
    - `bridge_url` = `http://host.docker.internal:8089` (default)
    - `bridge_token` = leave empty unless you set `BRIDGE_OUTBOUND_TOKEN` on the bridge
-   - `openwebui_url` = `https://oi.example.com` (your OWUI base URL)
+   - `openwebui_url` = `https://openwebui.example.com` (your OWUI base URL)
 4. Enable the tool on your model or per-chat
 
 With this tool installed, OWUI agents can ping you on Telegram **and** when you reply, the bridge routes your reply back into the same chat the agent was working in.
