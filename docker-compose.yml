@@ -1,0 +1,21 @@
+services:
+  telegram-bridge:
+    build: .
+    image: nopenix/telegram-bride-openwebui:latest
+    container_name: owui-telegram-bridge
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # If Open WebUI runs on the host (not in a sibling container),
+      # host.docker.internal reaches it from inside the container.
+      # On Linux you may need to add: extra_hosts: ["host.docker.internal:host-gateway"]
+      OPENWEBUI_BASE_URL: ${OPENWEBUI_BASE_URL:-http://host.docker.internal:3000}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os, sys; sys.exit(0 if os.environ.get('TELEGRAM_BOT_TOKEN') else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
