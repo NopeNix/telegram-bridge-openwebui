@@ -1,5 +1,5 @@
 """
-Open WebUI Telegram Bridge (v1.2.1).
+Open WebUI Telegram Bridge (v1.2.2).
 
 Two-way Telegram bot that proxies conversations through Open WebUI's native
 chat API. Replies on Telegram appear in your real Open WebUI chat history
@@ -936,7 +936,7 @@ def main() -> None:
     if not OPENWEBUI_API_KEY:
         raise SystemExit("OPENWEBUI_API_KEY is required")
 
-    log.info("Starting Telegram → Open WebUI bridge (v1.2.1)")
+    log.info("Starting Telegram → Open WebUI bridge (v1.2.2)")
     log.info("Open WebUI:    %s", OPENWEBUI_BASE_URL)
     log.info("Sessions file: %s", SESSIONS_FILE)
     
@@ -973,7 +973,13 @@ def main() -> None:
         )
     else:
         log.info("Mode: polling (set WEBHOOK_URL to switch)")
-        app.run_polling(allowed_updates=Update.ALL_TYPES)
+        app.run_polling(
+            allowed_updates=Update.ALL_TYPES,
+            # Drop any pending updates AND force Telegram to release the
+            # previous bot's polling session. Without this, fast restarts
+            # trigger a 409 Conflict that can persist for several minutes.
+            drop_pending_updates=True,
+        )
 
 
 if __name__ == "__main__":
