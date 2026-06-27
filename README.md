@@ -57,7 +57,7 @@ The result: Telegram becomes a remote control for Open WebUI, and every chat you
                                           │ tool call (send_telegram)
                                           ▼
 ┌────────────┐    updates    ┌─────────────────────┐    REST     ┌──────────────┐
-│  Telegram  │ ────────────► │  telegram-bride     │ ──────────► │  Open WebUI  │
+│  Telegram  │ ────────────► │  telegram-bridge    │ ──────────► │  Open WebUI  │
 │  (your     │               │  (this container)   │             │  /api/v1/... │
 │   phone)   │ ◄──────────── │                     │ ◄────────── │              │
 └────────────┘   bot reply   └─────────────────────┘  completion  └──────────────┘
@@ -96,8 +96,8 @@ The result: Telegram becomes a remote control for Open WebUI, and every chat you
 ### 1. Clone
 
 ```bash
-git clone https://github.com/nopenix/telegram-bride-openwebui.git
-cd telegram-bride-openwebui
+git clone https://github.com/NopeNix/telegram-bridge-openwebui.git
+cd telegram-bridge-openwebui
 ```
 
 ### 2. Configure
@@ -278,8 +278,8 @@ You're not mounting the `data/` volume. `docker-compose.yml` includes `./data:/a
 Contributions are welcome. Please open an issue first to discuss substantial changes.
 
 ```bash
-git clone https://github.com/nopenix/telegram-bride-openwebui.git
-cd telegram-bride-openwebui
+git clone https://github.com/NopeNix/telegram-bridge-openwebui.git
+cd telegram-bridge-openwebui
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env  # then fill in your values

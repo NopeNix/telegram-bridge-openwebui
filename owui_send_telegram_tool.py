@@ -2,7 +2,7 @@
 title: Telegram Notifier (bridged)
 author: nopenix
 description: >
-  Send outbound notifications to Telegram via the telegram-bride-openwebui
+  Send outbound notifications to Telegram via the telegram-bridge-openwebui
   sidecar (recommended), with a fallback to direct Telegram Bot API calls.
   When the bridge is used, replies on Telegram continue the originating
   Open WebUI chat in both directions.
@@ -32,7 +32,7 @@ class Tools:
         bridge_url: str = Field(
             default="http://host.docker.internal:8089",
             description=(
-                "URL of the telegram-bride-openwebui sidecar's /api/outbound endpoint. "
+                "URL of the telegram-bridge-openwebui sidecar's /api/outbound endpoint. "
                 "When set, the bridge handles Telegram sending and remembers the message "
                 "mapping so replies continue the originating Open WebUI chat. "
                 "Leave empty to fall back to direct Telegram Bot API calls (no continuity)."
@@ -108,7 +108,7 @@ class Tools:
         owui_chat_id: str,
         include_backlink: bool,
     ) -> tuple[bool, str]:
-        """Send through the telegram-bride-openwebui sidecar."""
+        """Send through the telegram-bridge-openwebui sidecar."""
         url = self.valves.bridge_url.rstrip("/") + "/api/outbound"
         payload: dict[str, Any] = {
             "chat_id": owui_chat_id,
@@ -184,7 +184,7 @@ class Tools:
         include_backlink=False).
 
         When a bridge URL is configured, the message is sent via the
-        telegram-bride-openwebui sidecar so that Telegram replies continue
+        telegram-bridge-openwebui sidecar so that Telegram replies continue
         the originating chat. Without the bridge, this falls back to direct
         Telegram Bot API calls (replies will start a new chat).
 
