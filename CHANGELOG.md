@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.1] - 2026-06-27
+
+### Fixed
+- **Empty error on user-settings fetch failure.** `Could not fetch user settings: ` was
+  logged with an empty exception string because `httpx` exceptions with no args
+  stringify to `''`. Replaced with typed exception handlers (`TimeoutException`,
+  `HTTPError`, generic `Exception`) that log `type(e).__name__` and the actual
+  message — never empty again.
+- **Two-minute startup hang on OWUI unreachable.** The user-settings request used
+  the default `REQUEST_TIMEOUT` (120s). If OWUI was unreachable or restarting, the
+  bot would hang for two minutes before logging anything useful. Now uses a tight
+  5-second timeout for this single call.
+- **Container crash-loops on resolution failure.** `post_init` re-raised when
+  model resolution failed, which caused the container to exit and Docker to
+  restart-loop it forever. Now logs the error and starts anyway; `/health`
+  returns 503 until a model becomes resolvable, and incoming messages get a
+  clear error instead of a silent crash.
+
 ## [1.2.0] - 2026-06-27
 
 ### Added

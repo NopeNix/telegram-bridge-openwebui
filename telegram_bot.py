@@ -1,5 +1,5 @@
 """
-Open WebUI Telegram Bridge (v1.2.0).
+Open WebUI Telegram Bridge (v1.2.1).
 
 Two-way Telegram bot that proxies conversations through Open WebUI's native
 chat API. Replies on Telegram appear in your real Open WebUI chat history
@@ -152,16 +152,37 @@ class OpenWebUI:
     async def get_user_default_model(self) -> Optional[str]:
         """Fetch the authenticated user's UI default model."""
         try:
-            r = await self._client.get("/api/v1/users/user/settings")
+            # Tight timeout so this can't block startup for two minutes when
+            # OWUI is unreachable.
+            r = await self._client.get(
+                "/api/v1/users/user/settings",
+                timeout=httpx.Timeout(5.0, connect=5.0),
+            )
             if r.status_code != 200:
+                log.warning(
+                    "User-settings endpoint returned %s: %s",
+                    r.status_code, r.text[:200],
+                )
                 return None
             data = r.json()
             models = data.get("ui", {}).get("models", [])
             if models and models[0]:
                 return models[0]
+            log.warning("User-settings endpoint returned no model in ui.models")
+            return None
+        except httpx.TimeoutException as e:
+            log.warning("User-settings request timed out: %s", repr(e))
+            return None
+        except httpx.HTTPError as e:
+            log.warning("User-settings HTTP error: %s: %s", type(e).__name__, e)
+            return None
         except Exception as e:
-            log.warning("Could not fetch user settings: %s", e)
-        return None
+            # Last-resort: log the full exception so it's never silently empty.
+            log.warning(
+                "User-settings fetch failed unexpectedly: %s: %s",
+                type(e).__name__, e or repr(e),
+            )
+            return None
 
     async def new_chat(
         self,
@@ -346,7 +367,11 @@ async def resolve_model(specific: Optional[str] = None) -> ResolvedModel:
 
 def current_model() -> ResolvedModel:
     if _current_model is None:
-        raise RuntimeError("Model not yet resolved; should be set in post_init()")
+        raise RuntimeError(
+            "No model resolved. Set DEFAULT_MODEL in .env, configure a default "
+            "in Open WebUI user settings, or ensure /api/models returns at "
+            "least one entry."
+        )
     return _current_model
 
 
@@ -879,19 +904,30 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # Lifecycle hooks & entry point
 # ---------------------------------------------------------------------------
 async def post_init(app: Application) -> None:
-    """Resolve the model before the bot starts processing messages."""
+    """
+    Resolve the model before the bot starts processing messages.
+
+    Resilient to transient failures: if user-settings lookup hangs/fails,
+    the resolver falls through to first-available or env var. Only raises
+    if absolutely nothing can be resolved, and even then we log + exit
+    cleanly rather than crash-looping forever.
+    """
     log.info("Resolving model (env → user settings → first available)…")
     try:
         resolved = await resolve_model()
         set_current_model(resolved)
         log.info("✓ Model resolved: %s", resolved)
     except Exception as e:
-        log.error("Model resolution failed: %s", e)
+        log.error("Model resolution failed: %s: %s", type(e).__name__, e or repr(e))
         log.error(
             "Set DEFAULT_MODEL in .env, or configure a default model in "
             "Open WebUI user settings (Settings → Interface → Default Model)."
         )
-        raise
+        # Don't re-raise: that kills the container. Instead, leave the model
+        # unresolved so /health reports 503 and the operator gets a clear signal.
+        # Any incoming message will hit current_model() and raise a clear error
+        # instead of silently using a wrong model.
+        log.error("Bot will start but cannot serve messages until a model is resolvable.")
 
 
 def main() -> None:
@@ -900,7 +936,7 @@ def main() -> None:
     if not OPENWEBUI_API_KEY:
         raise SystemExit("OPENWEBUI_API_KEY is required")
 
-    log.info("Starting Telegram → Open WebUI bridge (v1.2.0)")
+    log.info("Starting Telegram → Open WebUI bridge (v1.2.1)")
     log.info("Open WebUI:    %s", OPENWEBUI_BASE_URL)
     log.info("Sessions file: %s", SESSIONS_FILE)
     
