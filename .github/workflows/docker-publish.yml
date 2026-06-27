@@ -38,10 +38,12 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.IMAGE_NAME }}
-          # flavor=latest=... pushes 'latest' only on default branch + tag pushes.
+          # flavor=latest=auto: adds 'latest' on semver tag pushes.
+          # type=raw,value=latest: also adds 'latest' on every push to default branch.
           flavor: |
             latest=auto
           tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
             type=ref,event=branch
             type=ref,event=pr
             type=semver,pattern={{version}}
