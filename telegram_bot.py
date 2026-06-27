@@ -1,5 +1,5 @@
 """
-Open WebUI Telegram Bridge (v1.2.2).
+Open WebUI Telegram Bridge (v1.2.3).
 
 Two-way Telegram bot that proxies conversations through Open WebUI's native
 chat API. Replies on Telegram appear in your real Open WebUI chat history
@@ -74,6 +74,10 @@ OUTBOUND_LISTEN: str = os.environ.get("OUTBOUND_LISTEN", "127.0.0.1")
 BRIDGE_OUTBOUND_TOKEN: str = os.environ.get("BRIDGE_OUTBOUND_TOKEN", "")
 STREAM_THROTTLE: float = float(os.environ.get("STREAM_THROTTLE_SECONDS", "1.0"))
 LOG_LEVEL: str = os.environ.get("LOG_LEVEL", "INFO")
+# How long after the bridge sends a message on a user's behalf we keep treating
+# that chat as "current" (so a plain non-reply message continues it).
+# 24h by default. Use /newchat to reset manually.
+LAST_OUTBOUND_TTL_SECONDS: int = int(os.environ.get("LAST_OUTBOUND_TTL_SECONDS", str(24 * 3600)))
 
 log = logging.getLogger("owui-telegram")
 logging.basicConfig(
@@ -494,6 +498,38 @@ class SessionStore:
         with self._lock:
             return self._data["outbound"].get(str(telegram_message_id))
 
+    def remember_last_outbound_for(
+        self, user_id: int, telegram_message_id: int, owui_chat_id: str
+    ) -> None:
+        """Stamp the user's last-outbound pointer (with current time)."""
+        with self._lock:
+            self._data.setdefault("last_outbound", {})
+            self._data["last_outbound"][str(user_id)] = {
+                "ts": time.time(),
+                "telegram_message_id": telegram_message_id,
+                "owui_chat_id": owui_chat_id,
+            }
+            self._save()
+
+    def get_last_outbound_for(
+        self, user_id: int, ttl_seconds: int
+    ) -> Optional[dict]:
+        """Return the user's most recent outbound message if within TTL, else None."""
+        with self._lock:
+            entry = self._data.get("last_outbound", {}).get(str(user_id))
+            if not entry:
+                return None
+            age = time.time() - float(entry.get("ts", 0))
+            if age > ttl_seconds:
+                return None
+            return entry
+
+    def clear_last_outbound_for(self, user_id: int) -> None:
+        """Used by /newchat to force the next message to start a fresh chat."""
+        with self._lock:
+            self._data.get("last_outbound", {}).pop(str(user_id), None)
+            self._save()
+
 
 sessions = SessionStore(SESSIONS_FILE)
 
@@ -674,6 +710,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 @authorized
 async def cmd_newchat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     sessions.update(update.effective_user.id, chat_id=None)
+    sessions.clear_last_outbound_for(update.effective_user.id)
     await update.message.reply_text("🆕 Next message will start a fresh chat.")
 
 
@@ -750,30 +787,42 @@ def _resolve_target_chat_id(update: Update, user_id: int) -> Optional[str]:
     Decide which OWUI chat a Telegram message should be appended to.
 
     Priority:
-    1. The user is replying to a message the bridge sent on behalf of an OWUI
-       chat (from the outbound map). Use that chat id — this is the
-       "agent-sent message → user reply → continue that agent's chat" flow.
-    2. The user is replying to ANY message the bot sent (e.g. a streaming
-       response), and we have a current chat for them. Continue it.
-    3. Otherwise None → on_message will create a new chat.
+    1. Explicit Telegram reply to a known outbound message (from outbound map).
+    2. Explicit Telegram reply to any bot message AND we have a current chat.
+    3. Plain (non-reply) message BUT the bridge recently sent something on
+       the user's behalf within LAST_OUTBOUND_TTL_SECONDS — continue that chat.
+       This is the default behavior the user wants: send any text on Telegram,
+       bridge figures out the current chat from context.
+    4. Otherwise None → on_message will create a new chat.
     """
     msg = update.message
-    if not msg or not msg.reply_to_message:
-        return None
 
-    reply_id = msg.reply_to_message.message_id
-    # (1) outbound map lookup — the critical fix
-    mapped = sessions.lookup_outbound(reply_id)
-    if mapped:
-        log.info("Routing reply via outbound map: tg_msg=%s -> owui_chat=%s",
-                 reply_id, mapped)
-        return mapped
+    # ---- (1) + (2): explicit Telegram reply ---------------------------
+    if msg and msg.reply_to_message:
+        reply_id = msg.reply_to_message.message_id
+        mapped = sessions.lookup_outbound(reply_id)
+        if mapped:
+            log.info(
+                "Routing reply via outbound map: tg_msg=%s -> owui_chat=%s",
+                reply_id, mapped,
+            )
+            return mapped
 
-    # (2) plain reply-to-bot → continue current chat
-    sender = msg.reply_to_message.from_user
-    if sender and sender.is_bot:
-        session = sessions.get(user_id)
-        return session.chat_id
+        sender = msg.reply_to_message.from_user
+        if sender and sender.is_bot:
+            session = sessions.get(user_id)
+            return session.chat_id
+
+    # ---- (3): plain message, fall back to last outbound within TTL ----
+    last = sessions.get_last_outbound_for(user_id, LAST_OUTBOUND_TTL_SECONDS)
+    if last:
+        log.info(
+            "Routing plain message via last_outbound (tg_msg=%s, age=%ds): owui_chat=%s",
+            last.get("telegram_message_id"),
+            int(time.time() - float(last.get("ts", 0))),
+            last.get("owui_chat_id"),
+        )
+        return last.get("owui_chat_id")
 
     return None
 
@@ -781,7 +830,11 @@ def _resolve_target_chat_id(update: Update, user_id: int) -> Optional[str]:
 async def _stream_reply_to_telegram(
     update: Update, chat_id: str, stream: AsyncIterator[str]
 ) -> None:
-    """Edit a placeholder message as tokens arrive, then chunk if needed."""
+    """Edit a placeholder message as tokens arrive, then chunk if needed.
+
+    Returns the message_id of the LAST message sent (the backlink), so the
+    caller can record it as the user's "last outbound" for continuity.
+    """
     placeholder = await update.message.reply_text("…")
     accumulated = ""
     last_edit = 0.0
@@ -806,7 +859,10 @@ async def _stream_reply_to_telegram(
         await update.message.reply_text(extra)
 
     chat_url = f"{OPENWEBUI_BASE_URL}/c/{chat_id}"
-    await update.message.reply_text(f"🔗 {chat_url}", disable_web_page_preview=True)
+    backlink_msg = await update.message.reply_text(
+        f"🔗 {chat_url}", disable_web_page_preview=True,
+    )
+    return backlink_msg.message_id
 
 
 @authorized
@@ -859,7 +915,13 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         )
         return
 
-    await _stream_reply_to_telegram(update, chat_id, stream)
+    last_tg_msg_id = await _stream_reply_to_telegram(update, chat_id, stream)
+    # Stamp this as the user's "last outbound" so a future plain (non-reply)
+    # message within LAST_OUTBOUND_TTL_SECONDS continues this chat.
+    if last_tg_msg_id:
+        sessions.remember_last_outbound_for(
+            user.id, last_tg_msg_id, chat_id,
+        )
 
 
 @authorized
@@ -936,7 +998,7 @@ def main() -> None:
     if not OPENWEBUI_API_KEY:
         raise SystemExit("OPENWEBUI_API_KEY is required")
 
-    log.info("Starting Telegram → Open WebUI bridge (v1.2.2)")
+    log.info("Starting Telegram → Open WebUI bridge (v1.2.3)")
     log.info("Open WebUI:    %s", OPENWEBUI_BASE_URL)
     log.info("Sessions file: %s", SESSIONS_FILE)
     
