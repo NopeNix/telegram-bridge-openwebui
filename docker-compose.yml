@@ -1,7 +1,7 @@
 services:
   telegram-bridge:
     build: .
-    image: nopenix/telegram-bride-openwebui:v1.1.0
+    image: nopenix/telegram-bride-openwebui:v1.2.0
     container_name: owui-telegram-bridge
     restart: unless-stopped
     env_file:
@@ -14,12 +14,17 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
-      # Only required if you enable webhook mode (WEBHOOK_URL) or want to
-      # hit the /health endpoint from outside the container.
-      - "8088:8088"   # /health
-      # - "8089:8089" # webhook port (uncomment when WEBHOOK_URL is set)
+      # Health endpoint — bound to all interfaces so Docker healthcheck (which runs
+      # *inside* the container's network namespace via `docker inspect`) works.
+      # Safe to expose externally too: it's read-only and returns just the model name.
+      - "8088:8088"
+      # /api/outbound — bound to 127.0.0.1 INSIDE the container by default.
+      # The OWUI tool runs in Open WebUI (sibling container or host), so it can
+      # reach this on host.docker.internal:8089. Do NOT expose 8089 to the host.
+      # If you need to expose it (e.g. OWUI is on a different host), set
+      # OUTBOUND_LISTEN=0.0.0.0 and add a port mapping + bearer token.
     volumes:
-      # Persist chat sessions across container restarts
+      # Persist chat sessions and the outbound message map across container restarts
       - ./data:/app/data
     healthcheck:
       # Real OWUI reachability probe — not just env-var presence

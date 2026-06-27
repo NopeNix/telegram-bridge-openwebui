@@ -36,6 +36,7 @@ The result: Telegram becomes a remote control for Open WebUI, and every chat you
 - 🚀 **Zero-friction setup** — single container, ~5 env vars, done
 - 🔁 **True two-way sync** — every Telegram reply becomes a user message in your Open WebUI chat history
 - 🔗 **Clickable backlinks** — every bot reply includes a `https://your-host/c/<chat-id>` link so you can jump straight back to the web UI
+- 🧬 **Agent continuity** — when an OWUI agent sends you a Telegram message, your reply continues *that* chat, not a new one (v1.2.0)
 - 🧠 **Auto model resolution** — env var → your OWUI default → first available. No more `Model not found`.
 - ⚡ **Streaming responses** — replies appear token-by-token in Telegram via `editMessageText`, throttled to respect rate limits
 - 📦 **Multi-message chunking** — long replies split at paragraph boundaries, not truncated
@@ -51,11 +52,19 @@ The result: Telegram becomes a remote control for Open WebUI, and every chat you
 ## How it works
 
 ```
+                                   OWUI agent or user
+                                          │
+                                          │ tool call (send_telegram)
+                                          ▼
 ┌────────────┐    updates    ┌─────────────────────┐    REST     ┌──────────────┐
 │  Telegram  │ ────────────► │  telegram-bride     │ ──────────► │  Open WebUI  │
 │  (your     │               │  (this container)   │             │  /api/v1/... │
 │   phone)   │ ◄──────────── │                     │ ◄────────── │              │
 └────────────┘   bot reply   └─────────────────────┘  completion  └──────────────┘
+        ▲                          │  ▲
+        │                          │  │
+        │      /api/outbound       │  │ /api/chat/completions (streamed)
+        └──────────────────────────┘  │
                                      │
                                      │ creates / appends to a real chat
                                      ▼
@@ -63,15 +72,17 @@ The result: Telegram becomes a remote control for Open WebUI, and every chat you
                               (visible in your sidebar)
 ```
 
-The bridge translates Telegram updates into two kinds of Open WebUI API calls:
+**Inbound** (phone → OWUI): Telegram updates → bridge → `/api/v1/chats/new` + `/api/chat/completions`. The bridge creates real, persistent chats.
 
-| Telegram event | Open WebUI call |
+**Outbound** (OWUI → phone, optional): the companion `send_telegram` OWUI tool (in `owui_send_telegram_tool.py`) POSTs to the bridge's `/api/outbound`. The bridge forwards to Telegram **and remembers the `telegram_message_id → owui_chat_id` mapping** so when you reply to the agent's message, the bridge routes your reply back to the originating OWUI chat.
+
+| Event | Open WebUI call |
 |---|---|
-| New message (or message without a reply) | `POST /api/v1/chats/new` → `POST /api/chat/completions` (streamed) |
-| Reply to one of the bot's messages | `POST /api/chat/completions` (streamed) |
-| Photo upload | `POST /api/v1/files/` → `POST /api/v1/chats/new` with file ref → `POST /api/chat/completions` |
-
-Because chats are created with Open WebUI's native chat endpoint, they persist with the same metadata as any other chat — model, system prompt, knowledge attachments, tool calls.
+| Telegram: new message | `POST /api/v1/chats/new` → `POST /api/chat/completions` (streamed) |
+| Telegram: reply to bridge's message | `POST /api/chat/completions` (streamed, continues existing chat) |
+| Telegram: reply to **agent-sent** message | `POST /api/chat/completions` (streamed, continues the *agent's* chat via outbound map) |
+| Telegram: photo upload | `POST /api/v1/files/` → `POST /api/v1/chats/new` with file ref → `POST /api/chat/completions` |
+| OWUI tool: `send_telegram` | `POST /api/outbound` on bridge → Telegram Bot API → bridge records `msg_id → chat_id` |
 
 ## Quick start
 
@@ -283,7 +294,30 @@ python telegram_bot.py
 - No data is logged except operational metadata (user IDs, error responses).
 - The `/health` endpoint exposes the current model name. Don't expose port `8088` to the public internet.
 
+## Companion: OWUI `send_telegram` tool
+
+The repo ships a companion OWUI tool at [`owui_send_telegram_tool.py`](owui_send_telegram_tool.py). It defaults to **bridge mode** and POSTs to `bridge_url/api/outbound` (default `http://host.docker.internal:8089`). It falls back to direct Telegram Bot API calls if `bridge_url` is empty.
+
+Install it in OWUI:
+1. Workspace → Tools → + Create
+2. Paste the contents of `owui_send_telegram_tool.py`
+3. Save and configure the **Valves**:
+   - `bridge_url` = `http://host.docker.internal:8089` (default)
+   - `bridge_token` = leave empty unless you set `BRIDGE_OUTBOUND_TOKEN` on the bridge
+   - `openwebui_url` = `https://oi.example.com` (your OWUI base URL)
+4. Enable the tool on your model or per-chat
+
+With this tool installed, OWUI agents can ping you on Telegram **and** when you reply, the bridge routes your reply back into the same chat the agent was working in.
+
 ## Changelog
+
+### v1.2.0
+- **`POST /api/outbound`** endpoint on the bridge — OWUI tool proxies here instead of calling Telegram directly
+- **`telegram_message_id → owui_chat_id` mapping** persisted in `sessions.json`
+- **Reply routing** checks the outbound map first, so replies to agent-sent messages continue the agent's chat
+- One-time migration from v1.1's flat session layout
+- Optional bearer-token auth (`BRIDGE_OUTBOUND_TOKEN`) for cross-host deployments
+- Companion `send_telegram` tool v2.0.0 (in `owui_send_telegram_tool.py`)
 
 ### v1.1.0
 

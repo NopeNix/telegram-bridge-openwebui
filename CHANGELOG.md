@@ -5,6 +5,43 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-06-27
+
+### Added
+- **`POST /api/outbound` HTTP endpoint** on the bridge (default port 8089) that accepts
+  outbound messages from the OWUI `send_telegram` tool. The bridge forwards to Telegram
+  and **stores the `telegram_message_id → owui_chat_id` mapping** in its persistent
+  session file.
+- **Continuity for agent-initiated chats**: when an OWUI agent sends a Telegram message
+  via the bridged tool, the bridge remembers the mapping. When you reply to that
+  Telegram message, the bridge looks up the originating OWUI chat and appends your
+  reply there — so the conversation continues in both directions regardless of who
+  started it.
+- **`OUTBOUND_PORT`**, **`OUTBOUND_LISTEN`**, **`BRIDGE_OUTBOUND_TOKEN`** env vars
+  for configuring the outbound API.
+- **Auto-save of session-file migrations** on boot.
+
+### Changed
+- **`SessionStore`** now keeps two top-level keys: `sessions` (per-user chat pointer
+  and system prompt) and `outbound` (Telegram message id → OWUI chat id map). One-time
+  migration from v1.1's flat layout runs on first boot.
+- **HTTP server refactor**: now serves both `/health` (port 8088, all interfaces) and
+  `/api/outbound` (port 8089, default bound to `127.0.0.1`) from the same `BaseHTTPRequestHandler`.
+- **`docker-compose.yml`**: explicitly does NOT expose port 8089 to the host. The OWUI
+  tool reaches the bridge via `host.docker.internal:8089` from inside its container.
+- **`requirements.txt`**: added `requests==2.32.3` for the sync outbound HTTP call.
+
+### Security
+- The outbound API defaults to `127.0.0.1` bind — only reachable from inside the bridge
+  container, or from the OWUI container via `host.docker.internal:8089`.
+- Optional `BRIDGE_OUTBOUND_TOKEN` enables bearer-token auth on `/api/outbound` for
+  deployments where the bridge and OWUI live on different hosts.
+
+### Companion change: OWUI `send_telegram` tool v2.0.0
+The OWUI tool now lives in `owui_send_telegram_tool.py`. It defaults to **bridge mode**
+(`bridge_url` valve) and falls back to direct Telegram Bot API calls if the bridge URL
+is empty. Drop the new file into Workspace → Tools in Open WebUI, replacing v1.0.
+
 ## [1.1.0] - 2026-06-27
 
 ### Added
@@ -35,5 +72,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `/start`, `/newchat`, `/id`, `/model` commands.
 - Allowlist via `ALLOWED_USER_IDS`.
 
+[1.2.0]: #120---2026-06-27
 [1.1.0]: #110---2026-06-27
 [1.0.0]: #100---2026-06-27

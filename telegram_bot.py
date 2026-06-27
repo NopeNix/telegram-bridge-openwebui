@@ -1,12 +1,20 @@
 """
-Open WebUI Telegram Bridge (v1.1.0).
+Open WebUI Telegram Bridge (v1.2.0).
 
 Two-way Telegram bot that proxies conversations through Open WebUI's native
 chat API. Replies on Telegram appear in your real Open WebUI chat history
 and vice versa.
 
+Inbound:  Telegram updates -> OWUI /api/v1/chats/new + /api/chat/completions
+Outbound: OWUI tool -> bridge /api/outbound -> Telegram Bot API
+
+The outbound path is critical for continuity: when an OWUI agent sends a
+Telegram message via the tool, the bridge remembers which Telegram message
+id was used. When the user replies to that message, the bridge looks up
+the originating OWUI chat id and continues the conversation there.
+
 Features:
-- Model auto-resolution: env var → user OWUI default → first available
+- Model auto-resolution: env var -> user OWUI default -> first available
 - Streaming responses with throttled message edits
 - Multi-message chunking for long replies
 - Image (photo) support via OWUI file upload
@@ -15,6 +23,7 @@ Features:
 - Persistent sessions across container restarts
 - Real HTTP /health endpoint for container orchestration
 - Optional webhook mode (set WEBHOOK_URL)
+- Optional bearer-token auth on /api/outbound
 """
 
 from __future__ import annotations
@@ -32,6 +41,7 @@ from pathlib import Path
 from typing import Any, AsyncIterator, Optional
 
 import httpx
+import requests
 from telegram import Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import (
@@ -56,9 +66,12 @@ ALLOWED_USER_IDS: set[int] = {
 REQUEST_TIMEOUT: float = float(os.environ.get("REQUEST_TIMEOUT", "120"))
 SESSIONS_FILE: str = os.environ.get("SESSIONS_FILE", "/app/data/sessions.json")
 WEBHOOK_URL: str = os.environ.get("WEBHOOK_URL", "").rstrip("/")
-WEBHOOK_PORT: int = int(os.environ.get("WEBHOOK_PORT", "8080"))
+WEBHOOK_PORT: int = int(os.environ.get("WEBHOOK_PORT", "8089"))
 WEBHOOK_LISTEN: str = os.environ.get("WEBHOOK_LISTEN", "0.0.0.0")
 HEALTH_PORT: int = int(os.environ.get("HEALTH_PORT", "8088"))
+OUTBOUND_PORT: int = int(os.environ.get("OUTBOUND_PORT", "8089"))
+OUTBOUND_LISTEN: str = os.environ.get("OUTBOUND_LISTEN", "127.0.0.1")
+BRIDGE_OUTBOUND_TOKEN: str = os.environ.get("BRIDGE_OUTBOUND_TOKEN", "")
 STREAM_THROTTLE: float = float(os.environ.get("STREAM_THROTTLE_SECONDS", "1.0"))
 LOG_LEVEL: str = os.environ.get("LOG_LEVEL", "INFO")
 
@@ -353,21 +366,62 @@ class UserSession:
 
 
 class SessionStore:
-    """JSON-backed per-user session storage with atomic writes."""
+    """
+    JSON-backed per-user session storage with atomic writes.
+
+    Stores two kinds of state:
+    - Per-user session: telegram_user_id -> { chat_id, system_prompt }
+    - Outbound message map: telegram_message_id -> owui_chat_id
+      (used to route Telegram replies back to the originating OWUI chat)
+    """
 
     def __init__(self, path: str) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
-        self._data: dict[str, dict[str, Any]] = self._load()
+        self._data: dict[str, Any] = self._load()
+        # Ensure subkeys exist
+        self._data.setdefault("sessions", {})
+        self._data.setdefault("outbound", {})
 
-    def _load(self) -> dict[str, dict[str, Any]]:
-        if self.path.exists():
+    def _load(self) -> dict[str, Any]:
+        if not self.path.exists():
+            return {"sessions": {}, "outbound": {}}
+        try:
+            data = json.loads(self.path.read_text())
+        except Exception as e:
+            log.warning("Could not load sessions from %s: %s", self.path, e)
+            return {"sessions": {}, "outbound": {}}
+
+        # One-time migration from v1.0/v1.1 format (root keys were user ids)
+        # to v1.2 format (everything nested under "sessions" / "outbound").
+        if not isinstance(data, dict):
+            return {"sessions": {}, "outbound": {}}
+        legacy = {
+            k: v for k, v in data.items()
+            if k not in ("sessions", "outbound")
+            and isinstance(v, dict)
+            and not v.get("outbound")  # avoid false positives
+        }
+        if legacy:
+            log.info("Migrating %d legacy session entries to v1.2 layout", len(legacy))
+            data.setdefault("sessions", {}).update(
+                {uid: {"chat_id": e.get("chat_id"), "system_prompt": e.get("system_prompt")}
+                 for uid, e in legacy.items()}
+            )
+            for k in legacy:
+                data.pop(k, None)
+        data.setdefault("sessions", {})
+        data.setdefault("outbound", {})
+        # Persist migration immediately so the file is clean from boot 1.
+        if legacy:
             try:
-                return json.loads(self.path.read_text())
+                tmp = self.path.with_suffix(".tmp")
+                tmp.write_text(json.dumps(data, indent=2))
+                tmp.replace(self.path)
             except Exception as e:
-                log.warning("Could not load sessions from %s: %s", self.path, e)
-        return {}
+                log.warning("Could not persist migration: %s", e)
+        return data
 
     def _save(self) -> None:
         try:
@@ -377,9 +431,10 @@ class SessionStore:
         except Exception as e:
             log.warning("Could not save sessions: %s", e)
 
+    # ---- user sessions ----------------------------------------------------
     def get(self, user_id: int) -> UserSession:
         with self._lock:
-            entry = self._data.setdefault(str(user_id), {})
+            entry = self._data["sessions"].setdefault(str(user_id), {})
             return UserSession(
                 chat_id=entry.get("chat_id"),
                 system_prompt=entry.get("system_prompt") or DEFAULT_SYSTEM_PROMPT or None,
@@ -389,7 +444,7 @@ class SessionStore:
                system_prompt: Optional[str] = None,
                clear_system_prompt: bool = False) -> UserSession:
         with self._lock:
-            entry = self._data.setdefault(str(user_id), {})
+            entry = self._data["sessions"].setdefault(str(user_id), {})
             if chat_id is not None:
                 entry["chat_id"] = chat_id
             if clear_system_prompt:
@@ -402,41 +457,163 @@ class SessionStore:
                 system_prompt=entry.get("system_prompt"),
             )
 
+    # ---- outbound message map --------------------------------------------
+    def remember_outbound(self, telegram_message_id: int, owui_chat_id: str) -> None:
+        """Record that a Telegram message id was sent on behalf of an OWUI chat."""
+        with self._lock:
+            self._data["outbound"][str(telegram_message_id)] = owui_chat_id
+            self._save()
+
+    def lookup_outbound(self, telegram_message_id: int) -> Optional[str]:
+        """Return the OWUI chat id that produced this Telegram message, if any."""
+        with self._lock:
+            return self._data["outbound"].get(str(telegram_message_id))
+
 
 sessions = SessionStore(SESSIONS_FILE)
 
 
 # ---------------------------------------------------------------------------
-# HTTP health server
+# HTTP health + outbound server
 # ---------------------------------------------------------------------------
-class _HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self) -> None:  # noqa: N802 (BaseHTTPRequestHandler API)
-        if self.path == "/health":
-            ready = _current_model is not None
-            self.send_response(200 if ready else 503)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            body = {
-                "status": "ok" if ready else "starting",
-                "model": str(_current_model) if _current_model else None,
-            }
-            self.wfile.write(json.dumps(body).encode())
-        else:
-            self.send_response(404)
-            self.end_headers()
+class _BaseHandler(BaseHTTPRequestHandler):
+    """Shared handler for both the /health and /api/outbound endpoints."""
 
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
         # Silence the default request logger; we have our own.
         return
 
+    def _write_json(self, status: int, payload: dict[str, Any]) -> None:
+        body = json.dumps(payload).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
-def start_health_server(port: int) -> None:
-    server = HTTPServer(("0.0.0.0", port), _HealthHandler)
-    thread = threading.Thread(
-        target=server.serve_forever, daemon=True, name="health-server"
+    def do_GET(self) -> None:  # noqa: N802 (BaseHTTPRequestHandler API)
+        if self.path == "/health":
+            ready = _current_model is not None
+            self._write_json(
+                200 if ready else 503,
+                {
+                    "status": "ok" if ready else "starting",
+                    "model": str(_current_model) if _current_model else None,
+                    "outbound_endpoint": "ready",
+                },
+            )
+            return
+        self._write_json(404, {"error": "not found"})
+
+    def do_POST(self) -> None:  # noqa: N802
+        if self.path == "/api/outbound":
+            self._handle_outbound()
+            return
+        self._write_json(404, {"error": "not found"})
+
+    def _handle_outbound(self) -> None:
+        """Receive a message from the OWUI tool, send via Telegram, remember the mapping."""
+        # Auth check (only enforced when BRIDGE_OUTBOUND_TOKEN is set)
+        if BRIDGE_OUTBOUND_TOKEN:
+            auth = self.headers.get("Authorization", "")
+            if auth != f"Bearer {BRIDGE_OUTBOUND_TOKEN}":
+                log.warning("Rejected /api/outbound: bad/missing auth header")
+                self._write_json(401, {"error": "unauthorized"})
+                return
+
+        # Parse body
+        length = int(self.headers.get("Content-Length", "0"))
+        try:
+            body = json.loads(self.rfile.read(length) or b"{}")
+        except json.JSONDecodeError as e:
+            self._write_json(400, {"error": f"invalid JSON: {e}"})
+            return
+
+        chat_id = body.get("chat_id", "").strip()
+        message = body.get("message", "").strip()
+        title = body.get("title", "").strip() or None
+        include_backlink = bool(body.get("include_backlink", True))
+        openwebui_url = body.get("openwebui_url", "").strip().rstrip("/") or OPENWEBUI_BASE_URL
+
+        if not chat_id:
+            self._write_json(400, {"error": "chat_id is required"})
+            return
+        if not message:
+            self._write_json(400, {"error": "message is required"})
+            return
+
+        # Compose the text (same format the v1.0 tool used, for compat)
+        parts: list[str] = []
+        if title:
+            parts.append(f"*{title}*\n")
+        parts.append(message)
+        if include_backlink:
+            parts.append(f"\n🔗 Open conversation in Open WebUI →: {openwebui_url}/c/{chat_id}")
+        text = "\n".join(parts).strip()
+
+        # Send via Telegram Bot API (sync, since we run in a thread)
+        try:
+            resp = requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                data={
+                    "chat_id": ALLOWED_USER_IDS.__iter__().__next__() if ALLOWED_USER_IDS else "",
+                    "text": text,
+                    "parse_mode": "Markdown",
+                    "disable_web_page_preview": "true",
+                },
+                timeout=REQUEST_TIMEOUT,
+            )
+        except Exception as e:
+            log.exception("Telegram send failed")
+            self._write_json(502, {"error": f"telegram request failed: {e}"})
+            return
+
+        if resp.status_code != 200:
+            try:
+                err = resp.json().get("description", resp.text)
+            except Exception:
+                err = resp.text
+            log.error("Telegram API error %s: %s", resp.status_code, err)
+            self._write_json(502, {"error": f"telegram: {err}"})
+            return
+
+        telegram_message_id = resp.json()["result"]["message_id"]
+        # Remember the mapping so a Telegram reply routes back to the OWUI chat
+        sessions.remember_outbound(telegram_message_id, chat_id)
+        log.info(
+            "Outbound: telegram_msg_id=%s -> owui_chat_id=%s (%d chars)",
+            telegram_message_id, chat_id, len(text),
+        )
+        self._write_json(
+            200,
+            {"ok": True, "telegram_message_id": telegram_message_id, "chat_id": chat_id},
+        )
+
+
+def start_http_server() -> None:
+    """
+    Start two HTTP listeners:
+    - /health on HEALTH_PORT (default 8088) bound to all interfaces, so Docker healthchecks work.
+    - /api/outbound on OUTBOUND_PORT (default 8089) bound to OUTBOUND_LISTEN (default 127.0.0.1)
+      so the OWUI tool inside the same host can reach it but the internet can't.
+    """
+    # Health server — public-ish, read-only
+    health_server = HTTPServer(("0.0.0.0", HEALTH_PORT), _BaseHandler)
+    threading.Thread(
+        target=health_server.serve_forever, daemon=True, name="health-server",
+    ).start()
+    log.info("Health endpoint: http://0.0.0.0:%d/health", HEALTH_PORT)
+
+    # Outbound API — loopback by default for safety
+    outbound_server = HTTPServer((OUTBOUND_LISTEN, OUTBOUND_PORT), _BaseHandler)
+    threading.Thread(
+        target=outbound_server.serve_forever, daemon=True, name="outbound-server",
+    ).start()
+    log.info(
+        "Outbound API:   http://%s:%d/api/outbound (auth: %s)",
+        OUTBOUND_LISTEN, OUTBOUND_PORT,
+        "bearer token" if BRIDGE_OUTBOUND_TOKEN else "disabled — relies on bind address",
     )
-    thread.start()
-    log.info("Health endpoint listening on :%d/health", port)
 
 
 # ---------------------------------------------------------------------------
@@ -499,7 +676,7 @@ async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(
             f"Current model: `{current_model().name}`\n"
             f"Source: {current_model().source}\n\n"
-            f"Available models:\n{model_lines}\n\n"
+            f"Available models (first 25):\n{model_lines}\n\n"
             f"Use `/model <name>` to switch.",
             parse_mode=ParseMode.MARKDOWN,
         )
@@ -543,12 +720,37 @@ async def cmd_system(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 # ---------------------------------------------------------------------------
 # Message handlers
 # ---------------------------------------------------------------------------
-def _is_reply_to_bot(update: Update) -> bool:
+def _resolve_target_chat_id(update: Update, user_id: int) -> Optional[str]:
+    """
+    Decide which OWUI chat a Telegram message should be appended to.
+
+    Priority:
+    1. The user is replying to a message the bridge sent on behalf of an OWUI
+       chat (from the outbound map). Use that chat id — this is the
+       "agent-sent message → user reply → continue that agent's chat" flow.
+    2. The user is replying to ANY message the bot sent (e.g. a streaming
+       response), and we have a current chat for them. Continue it.
+    3. Otherwise None → on_message will create a new chat.
+    """
     msg = update.message
     if not msg or not msg.reply_to_message:
-        return False
+        return None
+
+    reply_id = msg.reply_to_message.message_id
+    # (1) outbound map lookup — the critical fix
+    mapped = sessions.lookup_outbound(reply_id)
+    if mapped:
+        log.info("Routing reply via outbound map: tg_msg=%s -> owui_chat=%s",
+                 reply_id, mapped)
+        return mapped
+
+    # (2) plain reply-to-bot → continue current chat
     sender = msg.reply_to_message.from_user
-    return bool(sender and sender.is_bot)
+    if sender and sender.is_bot:
+        session = sessions.get(user_id)
+        return session.chat_id
+
+    return None
 
 
 async def _stream_reply_to_telegram(
@@ -570,8 +772,6 @@ async def _stream_reply_to_telegram(
                 pass
             last_edit = now
 
-    # Finalize: chunk the full reply, edit placeholder with first chunk,
-    # send remaining chunks as new messages, append backlink at the end.
     chunks = chunk_message(accumulated)
     try:
         await placeholder.edit_text(chunks[0])
@@ -593,14 +793,16 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     session = sessions.get(user.id)
     model = current_model()
+    target_chat_id = _resolve_target_chat_id(update, user.id)
 
     await context.bot.send_chat_action(
         chat_id=update.effective_chat.id, action=ChatAction.TYPING
     )
 
     try:
-        if session.chat_id and _is_reply_to_bot(update):
-            chat_id = session.chat_id
+        if target_chat_id:
+            chat_id = target_chat_id
+            sessions.update(user.id, chat_id=chat_id)
             stream = await owui.complete(
                 chat_id, model.name, text,
                 system_prompt=session.system_prompt,
@@ -648,7 +850,7 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
     try:
-        photo = update.message.photo[-1]  # largest size
+        photo = update.message.photo[-1]
         tg_file = await context.bot.get_file(photo.file_id)
         file_bytes = bytes(await tg_file.download_as_bytearray())
         file_id = await owui.upload_file(file_bytes, f"tg-{photo.file_unique_id}.jpg")
@@ -698,15 +900,16 @@ def main() -> None:
     if not OPENWEBUI_API_KEY:
         raise SystemExit("OPENWEBUI_API_KEY is required")
 
-    log.info("Starting Telegram → Open WebUI bridge (v1.1.0)")
+    log.info("Starting Telegram → Open WebUI bridge (v1.2.0)")
     log.info("Open WebUI:    %s", OPENWEBUI_BASE_URL)
     log.info("Sessions file: %s", SESSIONS_FILE)
+    
     log.info(
         "Allowed users: %s",
         sorted(ALLOWED_USER_IDS) or "(all — set ALLOWED_USER_IDS!)",
     )
 
-    start_health_server(HEALTH_PORT)
+    start_http_server()
 
     app = (
         Application.builder()
@@ -715,7 +918,6 @@ def main() -> None:
         .build()
     )
 
-    # Register PHOTO before TEXT so photos-with-caption go to on_photo
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("newchat", cmd_newchat))
     app.add_handler(CommandHandler("id", cmd_id))
