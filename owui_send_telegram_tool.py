@@ -7,7 +7,7 @@ description: >
   When the bridge is used, replies on Telegram continue the originating
   Open WebUI chat in both directions.
 required_open_webui_version: 0.4.0
-version: 2.0.0
+version: 2.1.0
 license: MIT
 """
 
@@ -72,6 +72,15 @@ class Tools:
                 "Used to build the chat backlink appended to each message."
             ),
         )
+        telegram_chat_id: str = Field(
+            default="",
+            description=(
+                "Telegram chat_id to send to (the number from @userinfobot). "
+                "REQUIRED for multi-user bridge deployments, OPTIONAL for "
+                "single-user setups (bridge will fall back to ALLOWED_USER_IDS). "
+                "Ignored when bridge_url is empty (direct mode uses Valves.chat_id instead)."
+            ),
+        )
         link_label: str = Field(
             default="Open conversation in Open WebUI →",
             description="Label for the clickable backlink appended to each message.",
@@ -116,6 +125,8 @@ class Tools:
             "include_backlink": include_backlink,
             "openwebui_url": self.valves.openwebui_url,
         }
+        if self.valves.telegram_chat_id:
+            payload["telegram_chat_id"] = self.valves.telegram_chat_id
         headers = {"Content-Type": "application/json"}
         if self.valves.bridge_token:
             headers["Authorization"] = f"Bearer {self.valves.bridge_token}"

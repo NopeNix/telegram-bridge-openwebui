@@ -1,5 +1,5 @@
 """
-Open WebUI Telegram Bridge (v1.2.3).
+Open WebUI Telegram Bridge (v1.2.4).
 
 Two-way Telegram bot that proxies conversations through Open WebUI's native
 chat API. Replies on Telegram appear in your real Open WebUI chat history
@@ -612,12 +612,36 @@ class _BaseHandler(BaseHTTPRequestHandler):
             parts.append(f"\n🔗 Open conversation in Open WebUI →: {openwebui_url}/c/{chat_id}")
         text = "\n".join(parts).strip()
 
+        # Determine the Telegram recipient chat_id.
+        # Priority: explicit telegram_chat_id in body > single ALLOWED_USER_IDS entry.
+        # Multi-user setups MUST pass telegram_chat_id explicitly — there's no
+        # other way for the bridge to know which Telegram user the OWUI agent
+        # is sending on behalf of.
+        telegram_chat_id = str(body.get("telegram_chat_id", "") or "").strip()
+        if not telegram_chat_id:
+            if len(ALLOWED_USER_IDS) == 1:
+                # Single-user deployment: fall back to the allowed user.
+                telegram_chat_id = str(next(iter(ALLOWED_USER_IDS)))
+                log.info(
+                    "Outbound: telegram_chat_id not in body, "
+                    "using sole ALLOWED_USER_IDS=%s", telegram_chat_id,
+                )
+            else:
+                # Empty or multi-user: we have no way to pick. Bail out cleanly.
+                err = (
+                    "telegram_chat_id is required in the request body "
+                    "(or set ALLOWED_USER_IDS to a single Telegram user id)"
+                )
+                log.error("Outbound rejected: %s", err)
+                self._write_json(400, {"error": err})
+                return
+
         # Send via Telegram Bot API (sync, since we run in a thread)
         try:
             resp = requests.post(
                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
                 data={
-                    "chat_id": ALLOWED_USER_IDS.__iter__().__next__() if ALLOWED_USER_IDS else "",
+                    "chat_id": telegram_chat_id,
                     "text": text,
                     "parse_mode": "Markdown",
                     "disable_web_page_preview": "true",
@@ -998,7 +1022,7 @@ def main() -> None:
     if not OPENWEBUI_API_KEY:
         raise SystemExit("OPENWEBUI_API_KEY is required")
 
-    log.info("Starting Telegram → Open WebUI bridge (v1.2.3)")
+    log.info("Starting Telegram → Open WebUI bridge (v1.2.4)")
     log.info("Open WebUI:    %s", OPENWEBUI_BASE_URL)
     log.info("Sessions file: %s", SESSIONS_FILE)
     
