@@ -20,6 +20,10 @@ wheels/
 .installed.cfg
 *.egg
 
+# Persistent runtime data (mounted as a volume in docker-compose.yml)
+# Contains your Telegram user id and OWUI chat ids — never commit it.
+data/
+
 # Virtual environments
 .venv/
 venv/
