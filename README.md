@@ -309,6 +309,29 @@ Install it in OWUI:
 
 With this tool installed, OWUI agents can ping you on Telegram **and** when you reply, the bridge routes your reply back into the same chat the agent was working in.
 
+## CI/CD
+
+Every push to `main` (and every `v*` tag) triggers [`.github/workflows/docker-publish.yml`](.github/workflows/docker-publish.yml), which builds the image with Docker Buildx and pushes it to Docker Hub as `nopenix/telegram-bridge-openwebui`.
+
+Tags pushed:
+- `latest` — every build from `main`
+- `1.2.0`, `1.2`, etc. — on `v*` tag pushes
+- short SHA — every build
+
+**One-time setup for the repo maintainer:**
+
+1. Create a Docker Hub access token: https://hub.docker.com/settings/security → New Access Token.
+2. Add it to GitHub: repo → Settings → Secrets and variables → Actions → New repository secret.
+   - Name: `DOCKER_HUB_TOKEN`
+   - Value: the token from step 1
+3. That's it. The next push to `main` will trigger the build.
+
+To pull the published image:
+
+```bash
+docker pull nopenix/telegram-bridge-openwebui:latest
+```
+
 ## Changelog
 
 ### v1.2.0

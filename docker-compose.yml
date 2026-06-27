@@ -1,7 +1,7 @@
 services:
   telegram-bridge:
     build: .
-    image: NopeNix/telegram-bridge-openwebui:v1.2.0
+    image: nopenix/telegram-bridge-openwebui:latest
     container_name: owui-telegram-bridge
     restart: unless-stopped
     env_file:
