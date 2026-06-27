@@ -16,8 +16,10 @@ RUN pip install -r requirements.txt
 # Copy the bot code
 COPY telegram_bot.py ./
 
-# Run as non-root for defense in depth
-RUN useradd --create-home --shell /bin/false --uid 1000 bot \
+# Pre-create the data dir the persistent sessions file lives in,
+# and hand ownership to the unprivileged 'bot' user.
+RUN mkdir -p /app/data \
+    && useradd --create-home --shell /bin/false --uid 1000 bot \
     && chown -R bot:bot /app
 USER bot
 

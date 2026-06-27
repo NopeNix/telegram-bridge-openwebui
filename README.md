@@ -9,6 +9,7 @@ Replies on Telegram appear in your real Open WebUI chat history — and vice ver
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/)
 [![python-telegram-bot 21.x](https://img.shields.io/badge/python--telegram--bot-21.x-blue.svg)](https://docs.python-telegram-bot.org/)
 [![Docker](https://img.shields.io/badge/docker-ready-blue.svg)](Dockerfile)
+[![v1.1.0](https://img.shields.io/badge/version-1.1.0-blue.svg)](CHANGELOG.md)
 
 [Features](#features) • [How it works](#how-it-works) • [Quick start](#quick-start) • [Configuration](#configuration) • [Commands](#commands) • [Troubleshooting](#troubleshooting)
 
@@ -22,10 +23,11 @@ Open WebUI has a built-in Telegram *tool* that lets the model push notifications
 
 This bridge fills that gap. It runs as a small sidecar service that:
 
-- Receives your Telegram messages (long polling, no public HTTPS endpoint needed)
+- Receives your Telegram messages (long polling by default, webhooks optional)
 - Creates real, persistent chats in Open WebUI via its native `/api/v1/chats/new` endpoint
 - Streams the model's reply back to Telegram with a clickable link to the conversation
 - Continues the same Open WebUI chat when you reply to one of the bot's messages
+- Resolves the right model automatically from your Open WebUI user settings
 
 The result: Telegram becomes a remote control for Open WebUI, and every chat you have over Telegram shows up in your sidebar with full history, tools, system prompts, and RAG — exactly as if you typed it in the web UI.
 
@@ -34,10 +36,17 @@ The result: Telegram becomes a remote control for Open WebUI, and every chat you
 - 🚀 **Zero-friction setup** — single container, ~5 env vars, done
 - 🔁 **True two-way sync** — every Telegram reply becomes a user message in your Open WebUI chat history
 - 🔗 **Clickable backlinks** — every bot reply includes a `https://your-host/c/<chat-id>` link so you can jump straight back to the web UI
+- 🧠 **Auto model resolution** — env var → your OWUI default → first available. No more `Model not found`.
+- ⚡ **Streaming responses** — replies appear token-by-token in Telegram via `editMessageText`, throttled to respect rate limits
+- 📦 **Multi-message chunking** — long replies split at paragraph boundaries, not truncated
+- 🖼️ **Image support** — send a photo on Telegram, it gets uploaded to OWUI and attached to a new chat
+- 🎯 **Per-chat system prompt** — `/system <prompt>` to scope behavior per Telegram chat
+- 🧠 **Per-session model switching** — `/model <name>` to change models mid-conversation
+- 💾 **Persistent sessions** — chat pointers survive container restarts via a JSON file
+- 🩺 **HTTP `/health` endpoint** — for Docker healthchecks, Uptime Kuma, K8s liveness probes
 - 🔒 **Per-user allowlist** — lock the bot to your Telegram user ID only
-- 🧠 **Model-agnostic** — works with any model your Open WebUI instance has access to (Ollama, OpenAI, Anthropic, custom)
-- 🛠️ **Tools pass-through** — Open WebUI tools (web search, knowledge bases, the `send_telegram` notifier you may already have) work in Telegram-initiated chats too
-- 🐳 **Tiny footprint** — `python:3.12-slim` base, runs comfortably on 50 MB RAM
+- 🛠️ **Tools pass-through** — Open WebUI tools (web search, knowledge bases, your `send_telegram` notifier) work in Telegram-initiated chats too
+- 🐳 **Tiny footprint** — `python:3.12-slim` base, runs on ~50 MB RAM
 
 ## How it works
 
@@ -58,8 +67,9 @@ The bridge translates Telegram updates into two kinds of Open WebUI API calls:
 
 | Telegram event | Open WebUI call |
 |---|---|
-| New message (or message without a reply) | `POST /api/v1/chats/new` → `POST /api/chat/completions` |
-| Reply to one of the bot's messages | `POST /api/chat/completions` (appends to existing chat) |
+| New message (or message without a reply) | `POST /api/v1/chats/new` → `POST /api/chat/completions` (streamed) |
+| Reply to one of the bot's messages | `POST /api/chat/completions` (streamed) |
+| Photo upload | `POST /api/v1/files/` → `POST /api/v1/chats/new` with file ref → `POST /api/chat/completions` |
 
 Because chats are created with Open WebUI's native chat endpoint, they persist with the same metadata as any other chat — model, system prompt, knowledge attachments, tool calls.
 
@@ -67,7 +77,7 @@ Because chats are created with Open WebUI's native chat endpoint, they persist w
 
 ### Prerequisites
 
-- A running [Open WebUI](https://github.com/open-webui/open-webui) instance
+- A running [Open WebUI](https://github.com/open-webui/open-webui) instance (v0.4.0+)
 - A Telegram bot token (get one from [@BotFather](https://t.me/BotFather))
 - Your Telegram user ID (get it from [@userinfobot](https://t.me/userinfobot))
 - Docker + Docker Compose (or Python 3.12+ if you prefer to run it bare)
@@ -85,7 +95,7 @@ cd telegram-bride-openwebui
 cp .env.example .env
 ```
 
-Edit `.env` and fill in the required values:
+Edit `.env` and fill in the **required** values:
 
 ```dotenv
 TELEGRAM_BOT_TOKEN=123456789:ABCdefGHIjklMNOpqrsTUVwxyz
@@ -96,9 +106,14 @@ ALLOWED_USER_IDS=123456789
 
 `OPENWEBUI_BASE_URL` notes:
 
-- If Open WebUI runs **on the host** (not in a container): use `http://host.docker.internal:3000`
-- If Open WebUI runs **in a sibling container** on the same Docker network: use the service name, e.g. `http://open-webui:8080`
-- If both run on **bare metal**: use `http://localhost:3000`
+| Open WebUI location | Use this value |
+|---|---|
+| On the host (not in Docker) | `http://host.docker.internal:3000` |
+| Sibling container (same Docker network) | `http://open-webui:8080` |
+| Remote server | `https://openwebui.your-domain.com` |
+| Both running bare metal | `http://localhost:3000` |
+
+`DEFAULT_MODEL` can be left empty — the bot will auto-resolve from your OWUI user settings.
 
 ### 3. Run
 
@@ -112,17 +127,17 @@ Watch the logs:
 docker compose logs -f telegram-bridge
 ```
 
-You should see something like:
+You should see:
 
 ```
-INFO  owui-telegram: Starting Telegram → Open WebUI bridge
-INFO  owui-telegram: Open WebUI: http://host.docker.internal:3000 | default model: (default)
-INFO  owui-telegram: Allowed Telegram user IDs: [123456789]
+INFO  owui-telegram: Resolving model (env → user settings → first available)…
+INFO  owui-telegram: ✓ Model resolved: gpt-4o (from user settings (ui.models[0]))
+INFO  owui-telegram: Application started
 ```
 
 ### 4. Test
 
-Open Telegram, find your bot, send `/start`. Then send any message — within a few seconds you'll get a reply with a link to your brand new Open WebUI chat.
+Open Telegram, find your bot, send `/start`. Then send any message — within a few seconds you'll get a streamed reply with a link to your brand new Open WebUI chat.
 
 ## Configuration
 
@@ -133,10 +148,24 @@ All configuration is via environment variables (see [`.env.example`](.env.exampl
 | `TELEGRAM_BOT_TOKEN` | ✅ | — | Bot token from [@BotFather](https://t.me/BotFather) |
 | `OPENWEBUI_API_KEY` | ✅ | — | Open WebUI API key (Settings → Account → API Keys) |
 | `OPENWEBUI_BASE_URL` | | `http://localhost:3000` | Base URL of your Open WebUI instance |
-| `DEFAULT_MODEL` | | (OWUI default) | Model to use for new chats (e.g. `gpt-4o`, `llama3.1:8b`) |
-| `ALLOWED_USER_IDS` | ⭐ | (all) | Comma-separated Telegram user IDs. **Strongly recommended** to set. |
-| `REQUEST_TIMEOUT` | | `120` | HTTP timeout in seconds for Open WebUI API calls |
+| `DEFAULT_MODEL` | | auto | Model to use. If empty, uses OWUI user default → first available |
+| `DEFAULT_SYSTEM_PROMPT` | | (none) | Per-chat system prompt applied to every Telegram message |
+| `ALLOWED_USER_IDS` | ⭐ | (all) | Comma-separated Telegram user IDs. **Strongly recommended.** |
+| `REQUEST_TIMEOUT` | | `120` | HTTP timeout in seconds for OWUI API calls |
+| `SESSIONS_FILE` | | `/app/data/sessions.json` | Persistent session storage path |
 | `LOG_LEVEL` | | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` |
+| `STREAM_THROTTLE_SECONDS` | | `1.0` | Min seconds between Telegram message edits while streaming |
+| `WEBHOOK_URL` | | (polling) | When set, switches from long polling to webhook mode |
+| `WEBHOOK_PORT` | | `8089` | Port to listen on for Telegram webhooks |
+| `HEALTH_PORT` | | `8088` | Port for the HTTP `/health` endpoint |
+
+### Model auto-resolution chain
+
+When `DEFAULT_MODEL` is empty, the bot tries these in order:
+
+1. **`/api/v1/users/user/settings`** → reads `ui.models[0]` (your OWUI default)
+2. **`/api/models`** → picks the first available model
+3. **Fails loudly** at startup if neither yields a model — better than failing mid-conversation
 
 ### Bare-metal / non-Docker run
 
@@ -155,34 +184,57 @@ python telegram_bot.py
 | `/start` | Show usage help |
 | `/newchat` | Start a fresh chat on the next message |
 | `/id` | Show a link to the current chat |
-| `/model` | Show the default model in use |
+| `/model` | List available models + show current model |
+| `/model <name>` | Switch the active model mid-session |
+| `/system show` | Show the active system prompt for this chat |
+| `/system <prompt>` | Set a system prompt for this chat (persists) |
+| `/system clear` | Remove the system prompt (use OWUI default) |
 
 ### Conversation flow
 
 ```
 You:        "What's the best Python ORM in 2025?"
-Bot:        "SQLAlchemy 2.0 and SQLModel..."   ← new chat created
+Bot:        "SQLAlchemy 2.0 and SQLModel..."   ← streamed, new chat created
             🔗 http://host:3000/c/abc-123
 
 You:        (reply to that message) "Show me a SQLModel example"
-Bot:        "Here's a quick example..."         ← same chat continued
+Bot:        "Here's a quick example..."         ← streamed, same chat continued
             🔗 http://host:3000/c/abc-123
 
 You:        /newchat
 Bot:        "🆕 Next message will start a fresh chat."
 
-You:        "Now help me with a regex"
-Bot:        "Sure! What are you matching?"      ← new chat, new id
+You:        /model llama3.1
+Bot:        "✅ Switched to: llama3.1"
+
+You:        (sends a photo of code with caption "what does this do?")
+Bot:        "This code reads a CSV file..."     ← image uploaded, new chat
             🔗 http://host:3000/c/def-456
 ```
+
+### Health endpoint
+
+```bash
+curl http://localhost:8088/health
+# {"status": "ok", "model": "gpt-4o (from user settings (ui.models[0]))"}
+```
+
+Returns `200` when the bot is fully initialized, `503` while still booting.
 
 ## Troubleshooting
 
 ### Bot doesn't reply
 
 1. Check `docker compose logs telegram-bridge` for errors.
-2. Verify `TELEGRAM_BOT_TOKEN` is correct — `/start` should always respond even if Open WebUI is down.
+2. Verify `TELEGRAM_BOT_TOKEN` is correct — `/start` should always respond even if OWUI is down.
 3. Verify `ALLOWED_USER_IDS` contains your Telegram user ID. If empty, all users are allowed.
+
+### `❌ Open WebUI returned 400 — Model not found`
+
+`DEFAULT_MODEL` is empty and auto-resolution picked a model ID that doesn't exist. Either:
+- Set a real `DEFAULT_MODEL` in `.env`, or
+- Configure your default model in Open WebUI (Settings → Interface → Default Model), or
+- Run `/model <existing-model-id>` in Telegram to override
 
 ### `❌ Open WebUI returned 401`
 
@@ -190,31 +242,25 @@ Wrong or expired `OPENWEBUI_API_KEY`. Generate a new one in Settings → Account
 
 ### `❌ Open WebUI returned 403`
 
-The API key's user lacks permission for some operation (usually the chat creation). Make sure the key belongs to an admin or has the required group permissions.
+The API key's user lacks permission. Make sure the key belongs to an admin or has the required group permissions.
 
 ### `❌ Open WebUI returned 404`
 
 `OPENWEBUI_BASE_URL` doesn't resolve from inside the container. Try `http://host.docker.internal:3000` (host deployment) or the Docker service name (sibling container).
 
-### Chats appear in Open WebUI but messages look empty
+### Bot works, links don't open
 
-Open WebUI sometimes needs a moment to persist the assistant message. This is cosmetic — refreshing the chat in the web UI will show the full reply.
+`OPENWEBUI_BASE_URL` is set to a URL that isn't reachable from your phone. If your OWUI is behind a domain like `https://oi.example.com`, use that — not `http://localhost:3000`.
 
-### I want to use a different model per chat
+### Sessions forgotten after restart
 
-Set `DEFAULT_MODEL` to empty and either:
-
-- Configure your Open WebUI default model in Settings → Models, or
-- Modify `telegram_bot.py` to add a `/model <name>` command and pass `model` per-call
-
-PRs welcome for the latter.
+You're not mounting the `data/` volume. `docker-compose.yml` includes `./data:/app/data` — check that directory exists and is writable by the container user.
 
 ## Limitations
 
-- **Text only.** Photos, voice messages, and files are not yet handled. Contributions welcome.
+- **Voice messages** are not yet handled. (Image support shipped in v1.1.0; voice is next.)
 - **Single active chat per Telegram user.** Use `/newchat` to switch contexts.
-- **Long polling, not webhooks.** Simpler to deploy, but a webhook mode is planned for users who already have a public reverse proxy.
-- **No streaming responses.** The bot waits for the full reply before sending to Telegram. Token-by-token streaming is on the roadmap.
+- **Long polling by default** — fine for single-user setups. Webhook mode available via `WEBHOOK_URL`.
 
 ## Contributing
 
@@ -235,6 +281,27 @@ python telegram_bot.py
 - The bot reads/writes your Open WebUI data. Treat `OPENWEBUI_API_KEY` like a password.
 - The image runs as a non-root user (`uid 1000`) inside the container.
 - No data is logged except operational metadata (user IDs, error responses).
+- The `/health` endpoint exposes the current model name. Don't expose port `8088` to the public internet.
+
+## Changelog
+
+### v1.1.0
+
+- **Auto model resolution** — env var → OWUI user default → first available
+- **Streaming responses** with throttled message edits
+- **Multi-message chunking** for replies over 3500 chars
+- **Image (photo) support** via OWUI file upload
+- **`/model [name]`** command to list and switch models
+- **`/system <prompt>`** command for per-chat system prompts
+- **Persistent sessions** via JSON file (`/app/data/sessions.json`)
+- **HTTP `/health` endpoint** on port 8088
+- **Webhook mode** via `WEBHOOK_URL` env var
+- **Better error messages** showing model name and OWUI response body
+- **Real healthcheck** in docker-compose (probes `/api/models`)
+
+### v1.0.0
+
+- Initial release: long polling, text only, single chat per user
 
 ## License
 

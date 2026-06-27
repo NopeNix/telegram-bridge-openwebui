@@ -1,7 +1,7 @@
 services:
   telegram-bridge:
     build: .
-    image: nopenix/telegram-bride-openwebui:latest
+    image: nopenix/telegram-bride-openwebui:v1.1.0
     container_name: owui-telegram-bridge
     restart: unless-stopped
     env_file:
@@ -13,9 +13,20 @@ services:
       OPENWEBUI_BASE_URL: ${OPENWEBUI_BASE_URL:-http://host.docker.internal:3000}
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    ports:
+      # Only required if you enable webhook mode (WEBHOOK_URL) or want to
+      # hit the /health endpoint from outside the container.
+      - "8088:8088"   # /health
+      # - "8089:8089" # webhook port (uncomment when WEBHOOK_URL is set)
+    volumes:
+      # Persist chat sessions across container restarts
+      - ./data:/app/data
     healthcheck:
-      test: ["CMD", "python", "-c", "import os, sys; sys.exit(0 if os.environ.get('TELEGRAM_BOT_TOKEN') else 1)"]
+      # Real OWUI reachability probe — not just env-var presence
+      test:
+        - CMD-SHELL
+        - "python -c \"import os, httpx, sys; r = httpx.get(os.environ['OPENWEBUI_BASE_URL'] + '/api/models', headers={'Authorization': 'Bearer ' + os.environ['OPENWEBUI_API_KEY']}, timeout=5); sys.exit(0 if r.status_code == 200 else 1)\""
       interval: 30s
-      timeout: 5s
+      timeout: 10s
       retries: 5
-      start_period: 10s
+      start_period: 15s
